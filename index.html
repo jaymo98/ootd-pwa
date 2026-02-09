@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#ffffff" />
+
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="stylesheet" href="./styles.css" />
+
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="穿搭" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+
+  <title>穿搭小工具</title>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">👗</div>
+      <div class="title">穿搭小工具</div>
+    </div>
+    <button id="btnClearAll" class="btn danger ghost">清空数据</button>
+  </header>
+
+  <main class="layout">
+    <!-- 左：上传 -->
+    <section class="panel">
+      <div class="panel-title">添加衣服</div>
+
+      <div class="card">
+        <div class="field">
+          <label>图片</label>
+          <input id="fileInput" type="file" accept="image/*" />
+        </div>
+
+        <div class="preview-box">
+          <img id="imgPreview" alt="preview" />
+          <div id="previewEmpty" class="preview-empty">请选择图片</div>
+        </div>
+
+        <div class="form">
+          <div class="row2">
+            <div class="field">
+              <label>分类</label>
+              <select id="category">
+                <option value="">请选择</option>
+                <option value="hat">帽子</option>
+                <option value="scarf">围巾</option>
+                <option value="top">上衣</option>
+                <option value="pants">裤子</option>
+                <option value="shoes">鞋</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label>颜色</label>
+              <input id="color" type="text" placeholder="例如：白色 / 奶油色 / 藏青" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>标签</label>
+            <div class="row2">
+              <select id="tagSelect">
+                <option value="">请选择标签</option>
+              </select>
+              <input id="tagCustom" type="text" placeholder="自定义标签" style="display:none;" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>季节（可多选）</label>
+            <div class="chips" id="seasonChips"></div>
+          </div>
+
+          <div class="row">
+            <button id="btnSaveItem" class="btn">保存</button>
+            <button id="btnResetForm" class="btn ghost">清空</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 中：衣柜 -->
+    <section class="panel">
+      <div class="panel-title">衣柜</div>
+
+      <div class="card">
+        <div class="filters">
+          <div class="row2">
+            <div class="field">
+              <label>分类</label>
+              <select id="filterCategory">
+                <option value="">全部</option>
+                <option value="hat">帽子</option>
+                <option value="scarf">围巾</option>
+                <option value="top">上衣</option>
+                <option value="pants">裤子</option>
+                <option value="shoes">鞋</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label>颜色</label>
+              <select id="filterColorSelect">
+                <option value="">全部</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>标签</label>
+            <select id="filterTagSelect">
+              <option value="">全部</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label>季节（可多选）</label>
+            <div class="chips" id="filterSeasonChips"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="closetGrid" class="grid"></div>
+    </section>
+
+    <!-- 右：搭配 + 保存 -->
+    <section class="panel">
+      <div class="panel-title">当前搭配</div>
+
+      <div class="card">
+        <div class="row between">
+          <div></div>
+          <button id="btnClearOutfit" class="btn ghost sm">一键清空</button>
+        </div>
+
+        <div class="slots" id="slots"></div>
+
+        <div class="row" style="margin-top:10px;">
+          <input id="outfitName" class="grow" type="text" placeholder="搭配名称（可选）" />
+          <button id="btnSaveOutfit" class="btn">保存搭配</button>
+        </div>
+      </div>
+
+      <div class="panel-title">保存的搭配</div>
+      <div class="card">
+        <div id="outfitList" class="list"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 选择器弹窗 -->
+  <div id="pickerMask" class="mask hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <div id="pickerTitle" class="modal-title">选择</div>
+        <button id="pickerClose" class="btn ghost">关闭</button>
+      </div>
+      <div id="pickerGrid" class="grid modal-grid"></div>
+    </div>
+  </div>
+
+  <!-- 编辑弹窗 -->
+  <div id="editMask" class="mask hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <div class="modal-title">编辑</div>
+        <button id="editClose" class="btn ghost">关闭</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="edit-left">
+          <img id="editImg" alt="edit" />
+        </div>
+
+        <div class="edit-right">
+          <div class="row2">
+            <div class="field">
+              <label>分类</label>
+              <select id="editCategory">
+                <option value="hat">帽子</option>
+                <option value="scarf">围巾</option>
+                <option value="top">上衣</option>
+                <option value="pants">裤子</option>
+                <option value="shoes">鞋</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label>颜色</label>
+              <input id="editColor" type="text" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>标签</label>
+            <div class="row2">
+              <select id="editTagSelect">
+                <option value="">请选择标签</option>
+              </select>
+              <input id="editTagCustom" type="text" placeholder="自定义标签" style="display:none;" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>季节（可多选）</label>
+            <div class="chips" id="editSeasonChips"></div>
+          </div>
+
+          <div class="row">
+            <button id="btnEditSave" class="btn">保存</button>
+            <button id="btnEditDelete" class="btn danger ghost">删除</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
