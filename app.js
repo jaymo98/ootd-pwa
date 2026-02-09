@@ -3,7 +3,7 @@
 const $ = (id) => document.getElementById(id);
 
 const DB_NAME = "wardrobe_pwa_v4";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const STORE_ITEMS = "items";
 const STORE_OUTFITS = "outfits";
 
@@ -30,6 +30,7 @@ const SEASONS = [
   { key: "winter", label: "冬" }
 ];
 
+// 分类 -> 标签下拉（可继续扩充）
 const TAG_SUGGEST = {
   hat: ["棒球帽", "贝雷帽", "渔夫帽", "毛线帽"],
   scarf: ["围巾", "披肩", "丝巾"],
@@ -37,6 +38,26 @@ const TAG_SUGGEST = {
   pants: ["牛仔裤", "西裤", "阔腿裤", "短裤", "半身裙", "连衣裙"],
   shoes: ["运动鞋", "帆布鞋", "乐福鞋", "短靴", "长靴", "高跟鞋", "凉鞋"]
 };
+
+/* =========================
+   性能关键参数（你可按需调整）
+   ========================= */
+
+// 衣柜列表/选择器：缩略图尺寸（越小越省）
+const THUMB_MAX_DIM = 520;   // 建议 420~620
+const THUMB_QUALITY = 0.80;  // 建议 0.75~0.85
+
+// 编辑大图：保留细节但不至于巨大
+const FULL_MAX_DIM = 1400;   // 建议 1100~1600
+const FULL_QUALITY = 0.84;   // 建议 0.80~0.88
+
+// 衣柜：一次追加渲染多少张卡片（越小越省）
+const CLOSET_BATCH_SIZE = 24;
+
+// IntersectionObserver：提前多少像素开始加载
+const LAZY_ROOT_MARGIN = "500px";
+
+/* ========================= */
 
 function uuid() {
   if (crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -161,7 +182,6 @@ function fillSimpleSelect(selectEl, values, keepValue, emptyLabel = "全部") {
     selectEl.appendChild(o);
   }
 
-  // 尝试保留原选择（若已不存在则回到“全部”）
   if (old && uniq.includes(old)) selectEl.value = old;
   else selectEl.value = "";
 }
@@ -181,7 +201,7 @@ function updateFilterOptions() {
   fillSimpleSelect($("filterTagSelect"), tagBase, $("filterTagSelect").value, "全部");
 }
 
-/* ---------- image compress ---------- */
+/* ---------- image compress (two versions) ---------- */
 
 function fileToImage(file) {
   return new Promise((resolve, reject) => {
@@ -199,25 +219,54 @@ function fileToImage(file) {
   });
 }
 
-async function fileToCompressedBlob(file, maxDim = 1000, quality = 0.88) {
-  const img = await fileToImage(file);
+function blobToImage(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(e);
+    };
+    img.src = url;
+  });
+}
+
+async function imageToJpegBlob(img, maxDim, quality) {
   const w = img.naturalWidth || img.width;
   const h = img.naturalHeight || img.height;
 
   const scale = Math.min(1, maxDim / Math.max(w, h));
-  const nw = Math.round(w * scale);
-  const nh = Math.round(h * scale);
+  const nw = Math.max(1, Math.round(w * scale));
+  const nh = Math.max(1, Math.round(h * scale));
 
   const canvas = document.createElement("canvas");
   canvas.width = nw;
   canvas.height = nh;
+
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(img, 0, 0, nw, nh);
 
   const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
-  return blob || file;
+  return blob;
+}
+
+async function fileToTwoCompressedBlobs(file) {
+  const img = await fileToImage(file);
+  const thumbBlob = await imageToJpegBlob(img, THUMB_MAX_DIM, THUMB_QUALITY);
+  const fullBlob = await imageToJpegBlob(img, FULL_MAX_DIM, FULL_QUALITY);
+  return { thumbBlob: thumbBlob || file, fullBlob: fullBlob || file };
+}
+
+async function blobToThumbBlob(srcBlob) {
+  const img = await blobToImage(srcBlob);
+  const thumbBlob = await imageToJpegBlob(img, THUMB_MAX_DIM, THUMB_QUALITY);
+  return thumbBlob || srcBlob;
 }
 
 /* ---------- IndexedDB ---------- */
@@ -317,6 +366,7 @@ function renderSeasonChips(containerEl, stateSet) {
       if (stateSet.has(s.key)) stateSet.delete(s.key);
       else stateSet.add(s.key);
       renderSeasonChips(containerEl, stateSet);
+      if (containerEl === $("filterSeasonChips")) renderCloset(); // 过滤季节点完就刷新
     };
     containerEl.appendChild(div);
   }
@@ -365,7 +415,7 @@ function setPreviewFromFile(file) {
   img.setAttribute("src", url);
 }
 
-/* ---------- form helpers ---------- */
+/* ---------- helpers ---------- */
 
 function resetForm() {
   $("fileInput").value = "";
@@ -388,7 +438,14 @@ function normalizeItem(it) {
 
   const tag = normalizeStr(it.tag || "");
   const color = normalizeStr(it.color || "");
-  return { ...it, seasons, tag, color };
+  const imageBlob = it.imageBlob;
+  const imageThumbBlob = it.imageThumbBlob; // 新字段：缩略图
+  return { ...it, seasons, tag, color, imageBlob, imageThumbBlob };
+}
+
+function getThumbBlob(it) {
+  const n = normalizeItem(it);
+  return n.imageThumbBlob || n.imageBlob;
 }
 
 /* ---------- filters ---------- */
@@ -420,30 +477,99 @@ function filterItems(all) {
   });
 }
 
-/* ---------- closet render ---------- */
+/* =========================
+   懒加载：图片 + 分批渲染
+   ========================= */
 
-function renderCloset() {
-  const grid = $("closetGrid");
-  const list = filterItems(items);
+let imgObserver = null;
+let closetSentinelObserver = null;
 
-  if (list.length === 0) {
-    grid.innerHTML = `<div class="card" style="text-align:center; color: rgba(0,0,0,.45); font-weight:800;">
-      空空的
-    </div>`;
-    return;
+function ensureObservers() {
+  if (!imgObserver) {
+    imgObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        const img = e.target;
+        imgObserver.unobserve(img);
+        lazyLoadImg(img);
+      }
+    }, {
+      root: null,
+      rootMargin: LAZY_ROOT_MARGIN,
+      threshold: 0.01
+    });
   }
 
-  grid.innerHTML = "";
-  const sorted = list.slice().sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""));
+  if (!closetSentinelObserver) {
+    closetSentinelObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        if (closetRenderState && closetRenderState.hasMore()) {
+          closetRenderState.appendNextBatch();
+        }
+      }
+    }, {
+      root: null,
+      rootMargin: "900px",
+      threshold: 0.01
+    });
+  }
+}
 
-  for (const it of sorted) {
+function observeLazyImg(imgEl) {
+  ensureObservers();
+  imgObserver.observe(imgEl);
+}
+
+function lazyLoadImg(imgEl) {
+  const itemId = imgEl.dataset.itemId || "";
+  const kind = imgEl.dataset.kind || "thumb"; // thumb / full
+  const it = items.find(x => x.id === itemId);
+  if (!it) return;
+
+  let blob = null;
+  if (kind === "full") blob = normalizeItem(it).imageBlob;
+  else blob = getThumbBlob(it);
+
+  if (!blob) return;
+
+  const url = URL.createObjectURL(blob);
+  imgEl.loading = "lazy";
+  imgEl.decoding = "async";
+  imgEl.onload = () => URL.revokeObjectURL(url);
+  imgEl.onerror = () => URL.revokeObjectURL(url);
+  imgEl.src = url;
+}
+
+let closetRenderState = null;
+
+function createClosetRenderState(gridEl, list) {
+  let idx = 0;
+  const sentinel = document.createElement("div");
+  sentinel.style.height = "1px";
+  sentinel.style.width = "1px";
+
+  function clearGrid() {
+    gridEl.innerHTML = "";
+    gridEl.appendChild(sentinel);
+  }
+
+  function hasMore() {
+    return idx < list.length;
+  }
+
+  function makeItemCard(it) {
     const card = document.createElement("div");
     card.className = "item";
 
+    // img: 先不设 src，进入视口再加载
     const imgEl = document.createElement("img");
-    const url = URL.createObjectURL(it.imageBlob);
-    imgEl.src = url;
-    imgEl.onload = () => URL.revokeObjectURL(url);
+    imgEl.alt = "衣服";
+    imgEl.dataset.itemId = it.id;
+    imgEl.dataset.kind = "thumb";
+    imgEl.style.background = "rgba(0,0,0,.03)";
+    imgEl.removeAttribute("src");
+    observeLazyImg(imgEl);
 
     const body = document.createElement("div");
     body.className = "item-body";
@@ -498,8 +624,47 @@ function renderCloset() {
 
     card.appendChild(imgEl);
     card.appendChild(body);
-    grid.appendChild(card);
+    return card;
   }
+
+  function appendNextBatch() {
+    const end = Math.min(list.length, idx + CLOSET_BATCH_SIZE);
+    const frag = document.createDocumentFragment();
+    for (; idx < end; idx++) {
+      frag.appendChild(makeItemCard(list[idx]));
+    }
+    gridEl.insertBefore(frag, sentinel);
+    ensureObservers();
+    closetSentinelObserver.observe(sentinel);
+  }
+
+  clearGrid();
+
+  return {
+    clearGrid,
+    hasMore,
+    appendNextBatch,
+    sentinel
+  };
+}
+
+/* ---------- closet render ---------- */
+
+function renderCloset() {
+  const grid = $("closetGrid");
+  const list = filterItems(items).slice().sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""));
+
+  if (list.length === 0) {
+    grid.innerHTML = `<div class="card" style="text-align:center; color: rgba(0,0,0,.45); font-weight:800;">
+      空空的
+    </div>`;
+    closetRenderState = null;
+    return;
+  }
+
+  ensureObservers();
+  closetRenderState = createClosetRenderState(grid, list);
+  closetRenderState.appendNextBatch();
 }
 
 /* ---------- slots ---------- */
@@ -527,9 +692,11 @@ function renderSlots() {
     box.className = "slot-img";
     if (it) {
       const img = document.createElement("img");
-      const url = URL.createObjectURL(it.imageBlob);
-      img.src = url;
-      img.onload = () => URL.revokeObjectURL(url);
+      img.alt = "slot";
+      img.dataset.itemId = it.id;
+      img.dataset.kind = "thumb";
+      img.removeAttribute("src");
+      observeLazyImg(img);
       box.appendChild(img);
     } else {
       box.textContent = "空";
@@ -586,7 +753,7 @@ function clearOutfit() {
   toast("已清空");
 }
 
-/* ---------- picker modal ---------- */
+/* ---------- picker modal（也做懒加载） ---------- */
 
 function showMask(id) { $(id).classList.remove("hidden"); }
 function hideMask(id) { $(id).classList.add("hidden"); }
@@ -613,15 +780,19 @@ function openPickerForSlot(slotKey) {
     return;
   }
 
+  const frag = document.createDocumentFragment();
   for (const it of list) {
     const card = document.createElement("div");
     card.className = "item";
     card.style.cursor = "pointer";
 
     const imgEl = document.createElement("img");
-    const url = URL.createObjectURL(it.imageBlob);
-    imgEl.src = url;
-    imgEl.onload = () => URL.revokeObjectURL(url);
+    imgEl.alt = "选择衣服";
+    imgEl.dataset.itemId = it.id;
+    imgEl.dataset.kind = "thumb";
+    imgEl.style.background = "rgba(0,0,0,.03)";
+    imgEl.removeAttribute("src");
+    observeLazyImg(imgEl);
 
     const body = document.createElement("div");
     body.className = "item-body";
@@ -640,13 +811,14 @@ function openPickerForSlot(slotKey) {
 
     card.appendChild(imgEl);
     card.appendChild(body);
-    grid.appendChild(card);
+    frag.appendChild(card);
   }
 
+  grid.appendChild(frag);
   showMask("pickerMask");
 }
 
-/* ---------- edit modal ---------- */
+/* ---------- edit modal（编辑用大图） ---------- */
 
 async function openEdit(itemId) {
   const it0 = items.find(x => x.id === itemId);
@@ -655,9 +827,14 @@ async function openEdit(itemId) {
 
   currentEditId = itemId;
 
-  const url = URL.createObjectURL(it.imageBlob);
-  $("editImg").src = url;
-  $("editImg").onload = () => URL.revokeObjectURL(url);
+  // 编辑弹窗显示大图（full）
+  const imgEl = $("editImg");
+  imgEl.alt = "edit";
+  imgEl.dataset.itemId = it.id;
+  imgEl.dataset.kind = "full";
+  imgEl.removeAttribute("src");
+  // 直接加载（弹窗里立刻看见）
+  lazyLoadImg(imgEl);
 
   $("editCategory").value = it.category;
   $("editColor").value = it.color || "";
@@ -698,6 +875,7 @@ async function saveEdit() {
 
   await idbPut(STORE_ITEMS, it);
 
+  // 若分类改了，槽位按分类严格匹配：不匹配的就清掉
   for (const s of SLOTS) {
     if (activeOutfit[s.key] === it.id && s.key !== it.category) {
       activeOutfit[s.key] = null;
@@ -727,7 +905,7 @@ async function deleteEdit() {
   toast("已删除");
 }
 
-/* ---------- add item ---------- */
+/* ---------- add item（存两份 blob：thumb/full） ---------- */
 
 async function addItemFromForm() {
   const file = $("fileInput").files && $("fileInput").files[0];
@@ -742,7 +920,7 @@ async function addItemFromForm() {
   if (!tag) { toast("请输入标签"); return; }
   if (seasons.length === 0) { toast("请选择季节"); return; }
 
-  const blob = await fileToCompressedBlob(file, 1000, 0.88);
+  const { thumbBlob, fullBlob } = await fileToTwoCompressedBlobs(file);
 
   const item = {
     id: uuid(),
@@ -751,11 +929,12 @@ async function addItemFromForm() {
     color,
     tag,
     createdAt: nowISO(),
-    imageBlob: blob
+    imageBlob: fullBlob,
+    imageThumbBlob: thumbBlob
   };
 
   await idbPut(STORE_ITEMS, item);
-  await reloadData();      // 这里会同步刷新过滤下拉框
+  await reloadData(); // 会同步刷新过滤下拉 + 衣柜
   resetForm();
   toast("已保存");
 }
@@ -839,17 +1018,64 @@ async function clearAllData() {
   toast("已清空");
 }
 
+/* ---------- 补齐老数据的缩略图（分批） ---------- */
+
+let thumbBackfillRunning = false;
+
+async function backfillThumbsInBatches() {
+  if (thumbBackfillRunning) return;
+  thumbBackfillRunning = true;
+
+  try {
+    // 分批处理，避免一次性压缩太多
+    const pending = items
+      .map(normalizeItem)
+      .filter(it => it.imageBlob && !it.imageThumbBlob);
+
+    // 没有需要补齐的
+    if (pending.length === 0) return;
+
+    // 每次处理少量，处理完就让 UI 有机会喘口气
+    const BATCH = 4;
+    for (let i = 0; i < pending.length; i += BATCH) {
+      const slice = pending.slice(i, i + BATCH);
+      for (const it of slice) {
+        try {
+          const thumbBlob = await blobToThumbBlob(it.imageBlob);
+          const raw = items.find(x => x.id === it.id);
+          if (raw) {
+            raw.imageThumbBlob = thumbBlob;
+            await idbPut(STORE_ITEMS, raw);
+          }
+        } catch {
+          // 忽略单条失败
+        }
+      }
+
+      // 更新内存数据 + 刷新过滤（不强制重渲染衣柜，避免抖动）
+      items = await idbGetAll(STORE_ITEMS);
+      updateFilterOptions();
+
+      // 让出主线程
+      await new Promise(r => setTimeout(r, 0));
+    }
+  } finally {
+    thumbBackfillRunning = false;
+  }
+}
+
 /* ---------- reload ---------- */
 
 async function reloadData() {
   items = await idbGetAll(STORE_ITEMS);
   outfits = await idbGetAll(STORE_OUTFITS);
 
-  // 关键：每次数据变化都从 items 汇总出颜色/标签 -> 下拉框会同步包含自定义值
   updateFilterOptions();
-
   renderCloset();
   renderOutfitList();
+
+  // 不阻塞 UI 的后台补齐缩略图
+  backfillThumbsInBatches();
 }
 
 /* ---------- service worker ---------- */
@@ -924,8 +1150,6 @@ function bindEvents() {
 
   $("btnEditSave").addEventListener("click", saveEdit);
   $("btnEditDelete").addEventListener("click", deleteEdit);
-
-  $("filterSeasonChips").addEventListener("click", renderCloset);
 }
 
 window.addEventListener("load", async () => {
