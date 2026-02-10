@@ -23,6 +23,8 @@ const SLOTS = [
   { key: "shoes", label: "鞋" }
 ];
 
+const MULTI_SLOTS = new Set(["top", "pants"]); 
+
 const SEASONS = [
   { key: "spring", label: "春" },
   { key: "summer", label: "夏" },
@@ -30,7 +32,6 @@ const SEASONS = [
   { key: "winter", label: "冬" }
 ];
 
-// 分类 -> 标签下拉（可继续扩充）
 const TAG_SUGGEST = {
   hat: ["棒球帽", "贝雷帽", "渔夫帽", "毛线帽"],
   scarf: ["围巾", "披肩", "丝巾"],
@@ -40,21 +41,21 @@ const TAG_SUGGEST = {
 };
 
 /* =========================
-   性能关键参数（你可按需调整）
+   性能关键参数
    ========================= */
 
-// 衣柜列表/选择器：缩略图尺寸（越小越省）
-const THUMB_MAX_DIM = 520;   // 建议 420~620
-const THUMB_QUALITY = 0.80;  // 建议 0.75~0.85
+// 缩略图（衣柜/选择器/当前搭配）
+const THUMB_MAX_DIM = 520;
+const THUMB_QUALITY = 0.80;
 
-// 编辑大图：保留细节但不至于巨大
-const FULL_MAX_DIM = 1400;   // 建议 1100~1600
-const FULL_QUALITY = 0.84;   // 建议 0.80~0.88
+// 大图（编辑弹窗）
+const FULL_MAX_DIM = 1400;
+const FULL_QUALITY = 0.84;
 
-// 衣柜：一次追加渲染多少张卡片（越小越省）
+// 衣柜分批渲染
 const CLOSET_BATCH_SIZE = 24;
 
-// IntersectionObserver：提前多少像素开始加载
+// 图片懒加载提前量
 const LAZY_ROOT_MARGIN = "500px";
 
 /* ========================= */
@@ -345,7 +346,8 @@ function idbClear(storeName) {
 let items = [];
 let outfits = [];
 
-let activeOutfit = { hat: null, scarf: null, top: null, pants: null, shoes: null };
+// ✅ top/pants 是数组
+let activeOutfit = normalizeOutfitSlots({});
 
 let currentEditId = null;
 let pickerSlotKey = null;
@@ -366,7 +368,7 @@ function renderSeasonChips(containerEl, stateSet) {
       if (stateSet.has(s.key)) stateSet.delete(s.key);
       else stateSet.add(s.key);
       renderSeasonChips(containerEl, stateSet);
-      if (containerEl === $("filterSeasonChips")) renderCloset(); // 过滤季节点完就刷新
+      if (containerEl === $("filterSeasonChips")) renderCloset();
     };
     containerEl.appendChild(div);
   }
@@ -439,13 +441,70 @@ function normalizeItem(it) {
   const tag = normalizeStr(it.tag || "");
   const color = normalizeStr(it.color || "");
   const imageBlob = it.imageBlob;
-  const imageThumbBlob = it.imageThumbBlob; // 新字段：缩略图
+  const imageThumbBlob = it.imageThumbBlob;
   return { ...it, seasons, tag, color, imageBlob, imageThumbBlob };
 }
 
 function getThumbBlob(it) {
   const n = normalizeItem(it);
   return n.imageThumbBlob || n.imageBlob;
+}
+
+/* ---------- outfit multi-slot normalize ---------- */
+
+function asIdArray(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.filter(Boolean).map(String);
+  if (typeof v === "string") return [v];
+  return [];
+}
+
+function uniq(arr) {
+  const s = new Set();
+  const out = [];
+  for (const x of arr) {
+    const k = String(x);
+    if (!k) continue;
+    if (s.has(k)) continue;
+    s.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
+function normalizeOutfitSlots(slots) {
+  const s = slots || {};
+  return {
+    hat: s.hat || null,
+    scarf: s.scarf || null,
+    shoes: s.shoes || null,
+    top: uniq(asIdArray(s.top)),
+    pants: uniq(asIdArray(s.pants))
+  };
+}
+
+function removeItemFromOutfitEverywhere(itemId) {
+  const id = String(itemId);
+  for (const slot of SLOTS) {
+    if (MULTI_SLOTS.has(slot.key)) {
+      activeOutfit[slot.key] = (activeOutfit[slot.key] || []).filter(x => x !== id);
+    } else {
+      if (activeOutfit[slot.key] === id) activeOutfit[slot.key] = null;
+    }
+  }
+}
+
+function purgeOutfitByCategoryRule(itemId, newCategory) {
+  const id = String(itemId);
+  for (const slot of SLOTS) {
+    const k = slot.key;
+    if (k === newCategory) continue;
+    if (MULTI_SLOTS.has(k)) {
+      activeOutfit[k] = (activeOutfit[k] || []).filter(x => x !== id);
+    } else {
+      if (activeOutfit[k] === id) activeOutfit[k] = null;
+    }
+  }
 }
 
 /* ---------- filters ---------- */
@@ -562,7 +621,6 @@ function createClosetRenderState(gridEl, list) {
     const card = document.createElement("div");
     card.className = "item";
 
-    // img: 先不设 src，进入视口再加载
     const imgEl = document.createElement("img");
     imgEl.alt = "衣服";
     imgEl.dataset.itemId = it.id;
@@ -667,15 +725,61 @@ function renderCloset() {
   closetRenderState.appendNextBatch();
 }
 
-/* ---------- slots ---------- */
+/* ---------- slots（上衣/裤子多件） ---------- */
 
-function summarizeItem(it) {
+function summarizeOne(it) {
   const s = normalizeItem(it);
-  const seasonStr = (s.seasons || [])
-    .map(k => SEASONS.find(x => x.key === k)?.label || k)
-    .join("/") || "";
-  const parts = [s.tag, s.color, seasonStr].filter(Boolean);
-  return parts.join(" · ") || "—";
+  const parts = [s.tag, s.color].filter(Boolean);
+  return parts.join("·") || "—";
+}
+
+function summarizeMulti(ids) {
+  const list = (ids || []).map(id => items.find(x => x.id === id)).filter(Boolean);
+  if (list.length === 0) return "";
+  const texts = list.map(summarizeOne);
+  if (texts.length <= 2) return `${texts.length}件：${texts.join(" / ")}`;
+  return `${texts.length}件：${texts.slice(0,2).join(" / ")} ...`;
+}
+
+function makeThumbWithRemove(itemId, onRemove) {
+  const wrap = document.createElement("div");
+  wrap.style.position = "relative";
+  wrap.style.flex = "0 0 auto";
+  wrap.style.width = "54px";
+  wrap.style.height = "54px";
+  wrap.style.borderRadius = "16px";
+  wrap.style.overflow = "hidden";
+  wrap.style.background = "rgba(0,0,0,.03)";
+
+  const img = document.createElement("img");
+  img.alt = "thumb";
+  img.dataset.itemId = itemId;
+  img.dataset.kind = "thumb";
+  img.style.width = "100%";
+  img.style.height = "100%";
+  img.style.objectFit = "cover";
+  img.removeAttribute("src");
+  observeLazyImg(img);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "×";
+  btn.onclick = (e) => { e.stopPropagation(); onRemove(); };
+  btn.style.position = "absolute";
+  btn.style.top = "-6px";
+  btn.style.right = "-6px";
+  btn.style.width = "24px";
+  btn.style.height = "24px";
+  btn.style.borderRadius = "12px";
+  btn.style.border = "none";
+  btn.style.background = "rgba(255,255,255,.92)";
+  btn.style.boxShadow = "0 6px 18px rgba(0,0,0,.12)";
+  btn.style.fontWeight = "900";
+  btn.style.cursor = "pointer";
+
+  wrap.appendChild(img);
+  wrap.appendChild(btn);
+  return wrap;
 }
 
 function renderSlots() {
@@ -683,24 +787,17 @@ function renderSlots() {
   container.innerHTML = "";
 
   for (const s of SLOTS) {
-    const it = items.find(x => x.id === activeOutfit[s.key]) || null;
+    const k = s.key;
 
     const row = document.createElement("div");
     row.className = "slot";
 
     const box = document.createElement("div");
     box.className = "slot-img";
-    if (it) {
-      const img = document.createElement("img");
-      img.alt = "slot";
-      img.dataset.itemId = it.id;
-      img.dataset.kind = "thumb";
-      img.removeAttribute("src");
-      observeLazyImg(img);
-      box.appendChild(img);
-    } else {
-      box.textContent = "空";
-    }
+
+    // 点击图片区域也可以直接打开选择器
+    box.style.cursor = "pointer";
+    box.onclick = () => openPickerForSlot(k);
 
     const right = document.createElement("div");
     right.className = "slot-right";
@@ -711,26 +808,73 @@ function renderSlots() {
 
     const sub = document.createElement("div");
     sub.className = "slot-sub";
-    sub.textContent = it ? summarizeItem(it) : "";
 
     const actions = document.createElement("div");
     actions.className = "slot-actions";
 
     const btnChoose = document.createElement("button");
     btnChoose.className = "btn ghost sm";
-    btnChoose.textContent = "选择";
-    btnChoose.onclick = () => openPickerForSlot(s.key);
+    btnChoose.textContent = MULTI_SLOTS.has(k) ? "添加" : "选择";
+    btnChoose.onclick = () => openPickerForSlot(k);
 
     const btnClear = document.createElement("button");
     btnClear.className = "btn ghost sm";
     btnClear.textContent = "清除";
     btnClear.onclick = () => {
-      activeOutfit[s.key] = null;
+      clearSlot(k);
       renderSlots();
     };
 
     actions.appendChild(btnChoose);
     actions.appendChild(btnClear);
+
+    // 单件槽位
+    if (!MULTI_SLOTS.has(k)) {
+      const it = items.find(x => x.id === activeOutfit[k]) || null;
+      if (it) {
+        const img = document.createElement("img");
+        img.alt = "slot";
+        img.dataset.itemId = it.id;
+        img.dataset.kind = "thumb";
+        img.removeAttribute("src");
+        observeLazyImg(img);
+        box.innerHTML = "";
+        box.appendChild(img);
+        sub.textContent = summarizeOne(it);
+      } else {
+        box.textContent = "空";
+        sub.textContent = "";
+      }
+    } else {
+      // 多件槽位（top/pants）
+      const ids = activeOutfit[k] || [];
+      if (ids.length === 0) {
+        box.textContent = "空";
+        sub.textContent = "";
+      } else {
+        box.innerHTML = "";
+        const strip = document.createElement("div");
+        strip.style.display = "flex";
+        strip.style.gap = "8px";
+        strip.style.overflowX = "auto";
+        strip.style.alignItems = "center";
+        strip.style.padding = "2px";
+        strip.style.width = "100%";
+        strip.style.height = "100%";
+
+        for (const id of ids) {
+          const it = items.find(x => x.id === id);
+          if (!it) continue;
+          strip.appendChild(makeThumbWithRemove(id, () => {
+            removeFromSlot(k, id);
+            renderSlots();
+          }));
+        }
+
+        box.appendChild(strip);
+        sub.textContent = summarizeMulti(ids);
+      }
+    }
 
     right.appendChild(name);
     right.appendChild(sub);
@@ -743,17 +887,40 @@ function renderSlots() {
 }
 
 function setOutfitSlot(slotKey, itemId) {
-  activeOutfit[slotKey] = itemId;
+  const id = String(itemId);
+  if (!slotKey) return;
+
+  if (MULTI_SLOTS.has(slotKey)) {
+    const arr = activeOutfit[slotKey] || [];
+    if (!arr.includes(id)) arr.push(id);
+    activeOutfit[slotKey] = arr;
+  } else {
+    activeOutfit[slotKey] = id;
+  }
   renderSlots();
 }
 
+function removeFromSlot(slotKey, itemId) {
+  const id = String(itemId);
+  if (MULTI_SLOTS.has(slotKey)) {
+    activeOutfit[slotKey] = (activeOutfit[slotKey] || []).filter(x => x !== id);
+  } else {
+    if (activeOutfit[slotKey] === id) activeOutfit[slotKey] = null;
+  }
+}
+
+function clearSlot(slotKey) {
+  if (MULTI_SLOTS.has(slotKey)) activeOutfit[slotKey] = [];
+  else activeOutfit[slotKey] = null;
+}
+
 function clearOutfit() {
-  for (const s of SLOTS) activeOutfit[s.key] = null;
+  activeOutfit = normalizeOutfitSlots({});
   renderSlots();
   toast("已清空");
 }
 
-/* ---------- picker modal（也做懒加载） ---------- */
+/* ---------- picker modal（上衣/裤子支持连续添加） ---------- */
 
 function showMask(id) { $(id).classList.remove("hidden"); }
 function hideMask(id) { $(id).classList.add("hidden"); }
@@ -805,8 +972,9 @@ function openPickerForSlot(slotKey) {
 
     card.onclick = () => {
       setOutfitSlot(pickerSlotKey, it.id);
-      hideMask("pickerMask");
-      toast("已选择");
+      toast("已添加");
+      // ✅ 多件槽位不自动关闭，方便连续加
+      if (!MULTI_SLOTS.has(pickerSlotKey)) hideMask("pickerMask");
     };
 
     card.appendChild(imgEl);
@@ -827,13 +995,11 @@ async function openEdit(itemId) {
 
   currentEditId = itemId;
 
-  // 编辑弹窗显示大图（full）
   const imgEl = $("editImg");
   imgEl.alt = "edit";
   imgEl.dataset.itemId = it.id;
   imgEl.dataset.kind = "full";
   imgEl.removeAttribute("src");
-  // 直接加载（弹窗里立刻看见）
   lazyLoadImg(imgEl);
 
   $("editCategory").value = it.category;
@@ -875,12 +1041,8 @@ async function saveEdit() {
 
   await idbPut(STORE_ITEMS, it);
 
-  // 若分类改了，槽位按分类严格匹配：不匹配的就清掉
-  for (const s of SLOTS) {
-    if (activeOutfit[s.key] === it.id && s.key !== it.category) {
-      activeOutfit[s.key] = null;
-    }
-  }
+  // ✅ 分类改了：从不匹配槽位移除
+  purgeOutfitByCategoryRule(it.id, it.category);
 
   await reloadData();
   renderSlots();
@@ -895,9 +1057,8 @@ async function deleteEdit() {
 
   await idbDelete(STORE_ITEMS, it.id);
 
-  for (const s of SLOTS) {
-    if (activeOutfit[s.key] === it.id) activeOutfit[s.key] = null;
-  }
+  // ✅ 从搭配里移除（包含 top/pants 数组）
+  removeItemFromOutfitEverywhere(it.id);
 
   await reloadData();
   renderSlots();
@@ -934,23 +1095,29 @@ async function addItemFromForm() {
   };
 
   await idbPut(STORE_ITEMS, item);
-  await reloadData(); // 会同步刷新过滤下拉 + 衣柜
+  await reloadData();
   resetForm();
   toast("已保存");
 }
 
-/* ---------- outfits ---------- */
+/* ---------- outfits（保存/加载兼容 top/pants 多件） ---------- */
 
 async function saveCurrentOutfit() {
   const name = normalizeStr($("outfitName").value);
-  const hasAny = SLOTS.some(s => !!activeOutfit[s.key]);
+  const hasAny =
+    !!activeOutfit.hat ||
+    !!activeOutfit.scarf ||
+    !!activeOutfit.shoes ||
+    (activeOutfit.top && activeOutfit.top.length > 0) ||
+    (activeOutfit.pants && activeOutfit.pants.length > 0);
+
   if (!hasAny) { toast("搭配是空的"); return; }
 
   const outfit = {
     id: uuid(),
     name: name || `搭配 ${new Date().toLocaleString()}`,
     createdAt: nowISO(),
-    slots: { ...activeOutfit }
+    slots: normalizeOutfitSlots(activeOutfit)
   };
 
   await idbPut(STORE_OUTFITS, outfit);
@@ -983,7 +1150,7 @@ function renderOutfitList() {
     btnLoad.className = "btn ghost sm";
     btnLoad.textContent = "加载";
     btnLoad.onclick = () => {
-      activeOutfit = { hat: null, scarf: null, top: null, pants: null, shoes: null, ...(o.slots || {}) };
+      activeOutfit = normalizeOutfitSlots(o.slots || {});
       renderSlots();
       toast("已加载");
     };
@@ -1027,15 +1194,12 @@ async function backfillThumbsInBatches() {
   thumbBackfillRunning = true;
 
   try {
-    // 分批处理，避免一次性压缩太多
     const pending = items
       .map(normalizeItem)
       .filter(it => it.imageBlob && !it.imageThumbBlob);
 
-    // 没有需要补齐的
     if (pending.length === 0) return;
 
-    // 每次处理少量，处理完就让 UI 有机会喘口气
     const BATCH = 4;
     for (let i = 0; i < pending.length; i += BATCH) {
       const slice = pending.slice(i, i + BATCH);
@@ -1047,16 +1211,11 @@ async function backfillThumbsInBatches() {
             raw.imageThumbBlob = thumbBlob;
             await idbPut(STORE_ITEMS, raw);
           }
-        } catch {
-          // 忽略单条失败
-        }
+        } catch {}
       }
 
-      // 更新内存数据 + 刷新过滤（不强制重渲染衣柜，避免抖动）
       items = await idbGetAll(STORE_ITEMS);
       updateFilterOptions();
-
-      // 让出主线程
       await new Promise(r => setTimeout(r, 0));
     }
   } finally {
@@ -1074,7 +1233,6 @@ async function reloadData() {
   renderCloset();
   renderOutfitList();
 
-  // 不阻塞 UI 的后台补齐缩略图
   backfillThumbsInBatches();
 }
 
@@ -1109,7 +1267,7 @@ function bindEvents() {
   $("btnResetForm").addEventListener("click", () => { resetForm(); toast("已清空"); });
 
   $("filterCategory").addEventListener("change", () => {
-    updateFilterOptions(); // 分类变动时，标签下拉框按分类联动
+    updateFilterOptions();
     renderCloset();
   });
 
